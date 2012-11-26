@@ -23,6 +23,8 @@ use LWP::UserAgent;
 use HTML::DOM;
 use Class::Struct;
 use strict;
+use DBI;
+use DBD::SQLite;
 
 struct( Movie => {
         mv_title => '$',
@@ -30,6 +32,12 @@ struct( Movie => {
         mv_link => '$',
         mv_html => '$'
         }); 
+
+struct( User => {
+        usr_name => '$',
+        usr_login => '$',
+        usr_count => '$'
+        });
 
 my $ua = LWP::UserAgent->new("agent"=>"Mozilla/5.0 (Windows; U; Windows NT 6.1; en-US) AppleWebKit/534.10 (KHTML, like Gecko) Chrome/7.0.540.0 Safari/534.10");
 
@@ -45,7 +53,7 @@ push(@users, "user2");
 push(@users, "user3");
 push(@users, "user4");
 
-sub get_name
+sub get_name_and_count
 {
     my $site = shift;
     my $profile = shift;
@@ -58,15 +66,180 @@ sub get_name
 
     my $name = $dom_tree->getElementsByClassName("name")->[0]->innerHTML;
 
-    return $name;
+    my @seeCount = $dom_tree->getElementsByClassName("seeCount");
+
+    my $count;
+
+    foreach (@seeCount)
+    {
+        my $str = $_->innerHTML;
+        if($str =~ m!\Qfilmes/quero-ver/"\E>([0-9]+)!)
+        {
+            $count = $1;
+        }
+    }
+
+    my %ret = ();
+    $ret{"name"} = $name;
+    $ret{"count"} = $count;
+    return %ret;
+}
+
+sub clear_cache
+{
+  my $u = shift;
+
+  my $dbh = DBI->connect("dbi:SQLite:dbname=demo.db", "", "");
+
+  my $query = "SELECT id FROM users where login = ?";
+  my $sth = $dbh->prepare($query);
+  $sth->execute($u->usr_login);
+  $sth->bind_columns(\my($id));
+  $sth->fetch();
+
+  $query = "DELETE FROM users_movies where users_id = ?";
+  $sth = $dbh->prepare($query);
+  $sth->execute($id);
+
+  $query = "DELETE FROM users where id = ?";
+  $sth = $dbh->prepare($query);
+  $sth->execute($id);
+}
+
+sub save_cache
+{
+  my $u = shift;
+  my @movies = @_;
+
+  my $dbh = DBI->connect("dbi:SQLite:dbname=demo.db", "", "");
+  my $dbh2 = DBI->connect("dbi:SQLite:dbname=demo.db", "", "");
+  my $dbh3 = DBI->connect("dbi:SQLite:dbname=demo.db", "", "");
+
+  # first, a little checking to ensure everything is fine.
+  if(scalar(@movies) != $u->usr_count)
+  {
+    return;
+  }
+
+  my $query = "INSERT INTO 'users' (name, login, last_cached, movies_count) values (?, ?, ?, ?)";
+  my $query_handle = $dbh->prepare($query);
+  $query_handle->execute($u->usr_name, $u->usr_login, time, $u->usr_count);
+  my $key = $dbh->last_insert_id("","","",""); 
+
+  my $query_movies = "INSERT into 'movies' (title, img, link, html) values (?, ?, ?, ?)";
+  my $query_users_movies = "INSERT into 'users_movies' (users_id, movies_id) values (?, ?)";
+  my $query_exists_movie = "SELECT id FROM movies where link = ?";
+  my $query_movies_handle = $dbh2->prepare($query_movies);
+  my $query_users_movies_handle = $dbh->prepare($query_users_movies);
+  my $sth = $dbh3->prepare($query_exists_movie);
+
+  foreach my $m (@movies)
+  {
+    $sth->execute($m->mv_link);
+    $sth->bind_columns(\my($id));
+    my $mkey;
+    if($sth->fetch())
+    {
+      $mkey = $id;
+    }
+    else
+    {
+      $query_movies_handle->execute($m->mv_title, $m->mv_img, $m->mv_link, $m->mv_html);
+      $mkey = $dbh2->last_insert_id("","","","");
+    }
+    $query_users_movies_handle->execute($key, $mkey);
+  }
+}
+
+sub check_cache
+{
+    my $u = shift;
+    my @movies = @_;
+
+    my $dbargs;
+    my $dbh = DBI->connect("dbi:SQLite:dbname=demo.db", "", "", $dbargs);
+
+    my $query = "SELECT * FROM users where login = ?";
+    my $query_handle = $dbh->prepare($query);
+    $query_handle->execute($u->usr_login);
+    
+    $query_handle->bind_columns(\my($id, $name, $login, $last_cached, $movies_count));
+
+    my $total = 0;
+
+    while($query_handle->fetch())
+    {
+        $total++;
+    }
+
+    if($total == 0)
+    {
+      print STDERR "Cache: no record.\n";
+      # don't have a record about this user, let the crawler get the user data
+      return;
+    }
+    else
+    {
+      # we have some cache. Check if it is up to date.
+      if($movies_count != $u->usr_count)
+      {
+        print STDERR "Cache: counts differ.\n";
+        # cache is not up to date. clear the cache for this user, let the crawler get the user data.
+        clear_cache($u);
+        return;
+      }
+
+      print STDERR "Cache: Trying to get movies for user $id\n";
+      my $query_movies = "SELECT m.* FROM movies m INNER JOIN users_movies um ON ( m.id = um.movies_id ) WHERE um.users_id = ?";
+      my $query_movies_handle = $dbh->prepare($query_movies);
+      $query_movies_handle->execute($id);
+
+      $query_movies_handle->bind_columns(\my($m_id, $m_title, $m_img, $m_link, $m_html));
+
+      my $m_total = 0;
+
+      my $cache_is_valid = 1;
+
+      my %hash = ();
+
+      while($query_movies_handle->fetch())
+      {
+        if($m_total < scalar(@movies) && $m_link ne $movies[$m_total]->mv_link)
+        {
+          $cache_is_valid = 0;
+        }
+        my $m = new Movie;
+        $m->mv_title($m_title);
+        $m->mv_img($m_img);
+        $m->mv_link($m_link);
+        $m->mv_html($m_html);
+        $hash{$m->mv_link} = $m;
+        $m_total++;
+      }
+      if($cache_is_valid)
+      {
+        return %hash;
+      }
+      else
+      {
+        # user has new movies, even though the count is the same. clear cache, let the crawler get the data.
+
+        clear_cache($u);
+        return;
+      }
+    }
+    return;
 }
 
 sub get_movies
 {
     my $site = shift;
     my $next_page = shift;
+    my $u = shift;
     my %hash = ();
-    print keys %hash;
+    my $i = 0;
+    my $page = 0;
+    my @movies = ();
     do
     {
         my $url = $site . $next_page;
@@ -79,9 +252,6 @@ sub get_movies
         $dom_tree->close();
 
         my @my_movies = $dom_tree->getElementsByClassName("movie_list_item");
-
-        $next_page = $dom_tree->getElementsByClassName("next_page")->[0]->attributes->getNamedItem("href");
-
 
         foreach (@my_movies)
         {
@@ -102,10 +272,34 @@ sub get_movies
             $m->mv_html($html);
 
             $hash{$m->mv_link} = $m;
+            $movies[$i] = $m;
+            $i++;
         }
-        $next_page = $dom_tree->getElementsByClassName("next_page")->[0]->attributes->getNamedItem("href");
+
+        if($page == 0)
+        {
+          my %cache = check_cache($u, @movies);
+          if(%cache)
+          {
+            print STDERR "Using cache!\n";
+            return %cache;
+          }
+        }
+
+        my @next_pages = $dom_tree->getElementsByClassName("next_page");
+        if(scalar(@next_pages) > 0)
+        {
+          $next_page = $next_pages[0]->attributes->getNamedItem("href");
+        }
+        else
+        {
+          undef $next_page;
+        }
         print STDERR scalar(keys %hash)," filmes\n";
+        $page++;
     } while($next_page ne "");
+
+    save_cache($u, @movies);
 
     return %hash;
 }
@@ -117,13 +311,19 @@ my $compare_string;
 
 foreach my $user (@users)
 {
+    my $u = new User;
+    $u->usr_login($user);
     push(@user_pages, "/usuario/$user/");
-    my $user_name = get_name($site, $user_pages[$i]);
+    my %ret = get_name_and_count($site, $user_pages[$i]);
+    my $user_name = $ret{"name"};
+    my $movie_count = $ret{"count"};
+    $u->usr_name($user_name);
+    $u->usr_count($movie_count);
     push(@user_names, $user_name);
     my $next_page = $user_pages[$i]."filmes/quero-ver";
-    my %quero_ver = get_movies($site, $next_page);
+    my %quero_ver = get_movies($site, $next_page, $u);
 
-    if($i == scalar(@users) - 1)
+    if($i != 0 && $i == scalar(@users) - 1)
     {
         $compare_string_html .= " e ";
         $compare_string .= " e ";
@@ -141,7 +341,6 @@ foreach my $user (@users)
 }
 
 my %quero_ver_u1 = %{$quero_ver_lists[0]};
-
 
 $i = 0;
 my $result;
