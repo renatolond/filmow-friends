@@ -25,6 +25,7 @@ use Class::Struct;
 use strict;
 use DBI;
 use DBD::SQLite;
+use Data::Dumper;
 
 struct( Movie => {
         mv_title => '$',
@@ -57,7 +58,7 @@ sub get_name_and_count
 {
     my $site = shift;
     my $profile = shift;
-    my $url = $site.$profile;
+    my $url = $site.$profile."?test=444";
     my $content = $ua->get($url);
     die "Couldn't get $url. $!" unless defined $content;
     my $dom_tree = new HTML::DOM;
@@ -262,9 +263,9 @@ sub get_movies
             my $href = $_->getElementsByClassName("wrapper")->[0]->getElementsByTagName("A")->[0]; 
             $m->mv_link($href->attributes->getNamedItem("href"));
 
-            my $poster = $_->getElementsByClassName("poster")->[0];
+            my $poster = $_->getElementsByClassName("cover")->[0];
             my $title = $_->getElementsByClassName("title")->[0];
-            my $html = "<span class=\"wrapper\">".$poster->as_HTML."</span>\n".$title->as_HTML;
+            my $html = "<span class=\"wrapper\">".$poster->as_HTML."</span>\n";
 
             my $new_string = $site.$m->mv_link;
             my $test = quotemeta($m->mv_link);
@@ -286,10 +287,28 @@ sub get_movies
           }
         }
 
-        my @next_pages = $dom_tree->getElementsByClassName("next_page");
-        if(scalar(@next_pages) > 0)
+        my @next_pages = ();
+		my $next_length = 0;
+		if($dom_tree->getElementsByClassName("pagination")->length > 0) {
+		  @next_pages = $dom_tree->getElementsByClassName("pagination")->[0]->getElementsByTagName("ul")->[0]->getElementsByTagName("li");
+		  $next_length = $dom_tree->getElementsByClassName("pagination")->[0]->getElementsByTagName("ul")->[0]->getElementsByTagName("li")->length;
+		}
+        if($next_length > 0)
         {
-          $next_page = $next_pages[0]->attributes->getNamedItem("href");
+			my $next = 0;
+			foreach(@next_pages)
+			{
+				if($_->getElementsByClassName("active")->length!=0) {
+					last;
+				}
+				$next++;
+			}
+			if($next+1 < $next_length) {
+			  $next_page = $next_pages[$next+1]->getElementsByTagName("A")->[0]->attributes->getNamedItem("href");
+			}
+			else {
+				undef $next_page;
+			}
         }
         else
         {
@@ -360,7 +379,7 @@ while ( (my $key, my $value) = each %quero_ver_u1 )
 
     if($exists)
     {
-        $result .= "<li class=\"movie_list_item";
+        $result .= "<li class=\"span2 movie_list_item";
         if(($i+1) % 6 == 0)
         {
             $result .= " loopbreaker_item";
